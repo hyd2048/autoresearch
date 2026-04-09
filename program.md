@@ -6,8 +6,8 @@
 
 要设置一个新的实验，请与用户一起完成以下步骤：
 
-1. **确定运行标签（run tag）**：根据今天的日期和使用的数据集提出一个标签（例如 `mar5-1st`）。分支 `autoanomaly/<tag>` 必须不存在——这是一个全新的实验。
-2. **创建分支**：从当前 autoanomaly 分支执行 `git checkout -b autoanomaly/<tag>`。
+1. **确定运行标签（run tag）**：根据今天的日期和使用的数据集提出一个标签（例如 `mar5-1st`）。分支 `exp/<tag>` 必须不存在——这是一个全新的实验。
+2. **创建分支**：从当前 autoanomaly 分支执行 `git checkout -b exp/<tag>`。
 3. **阅读范围内的文件**：该仓库较小，请阅读以下文件以获取完整上下文：
 
    * `README.md` —— 仓库背景信息。
@@ -28,7 +28,7 @@
 运行方式：
 
 ```
-uv run train.py
+uv run train.py --dataset 数据集编号
 ```
 
 **你可以做的：**
@@ -127,7 +127,7 @@ d4e5f6g	0.000000	0.0	crash	OOM
 
 ## The experiment loop
 
-实验在专用分支上进行（例如 `autoanomaly/mar5-1st`）。
+实验在专用分支上进行（例如 `exp/mar5-1st`）。
 
 **无限循环执行：**
 
@@ -137,7 +137,7 @@ d4e5f6g	0.000000	0.0	crash	OOM
 4. 运行实验：
 
 ```
-uv run train.py > run.log 2>&1
+uv run train.py --dataset 数据集编号 > run.log 2>&1
 ```
 
 （重定向所有输出，不要使用 tee）
