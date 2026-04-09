@@ -1,389 +1,403 @@
 """
-One-time data preparation for autoresearch experiments.
-Downloads data shards and trains a BPE tokenizer.
+Data preparation for NASA Bearing anomaly detection experiments.
+Loads bearing data, preprocesses it, and provides dataloaders.
 
 Usage:
-    python prepare.py                  # full prep (download + tokenizer)
-    python prepare.py --num-shards 8   # download only 8 shards (for testing)
-
-Data and tokenizer are stored in ~/.cache/autoresearch/.
+    python prepare.py                  # Run data prep (default: 2nd_test)
+    python prepare.py --dataset 1st    # Use 1st_test dataset
+    python prepare.py --dataset 2nd    # Use 2nd_test dataset
+    python prepare.py --dataset 3rd    # Use 3rd_test dataset
+    python prepare.py --force          # Ignore cache, re-prepare from scratch
+    python prepare.py --features       # Enable feature engineering (INPUT_DIM=12)
 """
 
 import os
-import sys
-import time
-import math
 import argparse
 import pickle
-from multiprocessing import Pool
 
-import requests
-import pyarrow.parquet as pq
-import rustbpe
-import tiktoken
+import numpy as np
+import pandas as pd
+from sklearn import preprocessing
+
 import torch
 
 # ---------------------------------------------------------------------------
-# Constants (fixed, do not modify)
+# 数据集配置
 # ---------------------------------------------------------------------------
 
-MAX_SEQ_LEN = 2048       # context length
-TIME_BUDGET = 300        # training time budget in seconds (5 minutes)
-EVAL_TOKENS = 40 * 524288  # number of tokens for val eval
+DATASET_CONFIGS = {
+    '1st': {
+        'dir': '1st_test/1st_test',
+        'num_sensors': 8,  # 1st_test 有8个通道（每个轴承2个）
+        'anomaly_start_date': '2003-11-19 00:00:00',  # 故障发生在11月19日后
+        'train_end_time': '2003-11-15 23:59:59',      # 训练截止到11月15日
+    },
+    '2nd': {
+        'dir': '2nd_test/2nd_test',
+        'num_sensors': 4,
+        'anomaly_start_date': '2004-02-17 00:00:00',
+        'train_end_time': '2004-02-13 23:52:39',
+    },
+    '3rd': {
+        'dir': '3rd_test/4th_test/txt',
+        'num_sensors': 4,
+        'anomaly_start_date': '2004-04-01 00:00:00',  # 故障发生在4月1日后
+        'train_end_time': '2004-03-20 23:59:59',      # 训练截止到3月20日
+    },
+}
+
+DEFAULT_DATASET = '2nd'
 
 # ---------------------------------------------------------------------------
-# Configuration
+# 常量（固定，不要修改）
 # ---------------------------------------------------------------------------
 
-CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
-DATA_DIR = os.path.join(CACHE_DIR, "data")
-TOKENIZER_DIR = os.path.join(CACHE_DIR, "tokenizer")
-BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-VAL_SHARD = MAX_SHARD  # pinned validation shard (shard_06542)
-VAL_FILENAME = f"shard_{VAL_SHARD:05d}.parquet"
-VOCAB_SIZE = 8192
-
-# BPE split pattern (GPT-4 style, with \p{N}{1,2} instead of {1,3})
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-
-SPECIAL_TOKENS = [f"<|reserved_{i}|>" for i in range(4)]
-BOS_TOKEN = "<|reserved_0|>"
+TIME_BUDGET  = 300   # 训练时间预算，秒（5分钟）
 
 # ---------------------------------------------------------------------------
-# Data download
+# 路径配置
 # ---------------------------------------------------------------------------
 
-def download_single_shard(index):
-    """Download one parquet shard with retries. Returns True on success."""
-    filename = f"shard_{index:05d}.parquet"
-    filepath = os.path.join(DATA_DIR, filename)
-    if os.path.exists(filepath):
-        return True
+DATA_DIR      = os.path.join(os.path.dirname(__file__), "dataset")
+CACHE_DIR     = os.path.join(os.path.expanduser("~"), ".cache", "auto-anomaly")
+CACHE_VERSION = 4   # 修改数据处理逻辑时请递增此值，旧缓存会自动失效
 
-    url = f"{BASE_URL}/{filename}"
-    max_attempts = 5
-    for attempt in range(1, max_attempts + 1):
+# 全局变量：当前使用的数据集
+_current_dataset = DEFAULT_DATASET
+
+# ---------------------------------------------------------------------------
+# 异常标签
+# ---------------------------------------------------------------------------
+
+def get_anomaly_labels(merged_data: pd.DataFrame, dataset: str = None) -> np.ndarray:
+    """
+    根据领域知识生成异常标签。
+    异常起始时间之后的样本标记为异常（1），之前为正常（0）。
+    """
+    if dataset is None:
+        dataset = _current_dataset
+    config = DATASET_CONFIGS[dataset]
+    anomaly_start = pd.Timestamp(config['anomaly_start_date'])
+    labels = (merged_data.index >= anomaly_start).astype(int)
+    return labels.values if hasattr(labels, 'values') else np.array(labels)
+
+
+# ---------------------------------------------------------------------------
+# 数据加载
+# ---------------------------------------------------------------------------
+
+def load_bearing_data(dataset: str = None) -> pd.DataFrame:
+    """
+    从指定数据集目录加载所有轴承数据文件。
+
+    Args:
+        dataset: 数据集名称 ('1st', '2nd', '3rd')
+
+    每个文件对应一个时间点，包含 4 列（4个传感器）的原始振动信号。
+    取每列的均值绝对值作为特征，得到 shape=(N, 4) 的 DataFrame。
+
+    Returns:
+        merged_data: 以时间戳为索引、4列传感器特征的 DataFrame
+    """
+    if dataset is None:
+        dataset = _current_dataset
+
+    config = DATASET_CONFIGS[dataset]
+    data_dir = os.path.join(DATA_DIR, config['dir'])
+
+    if not os.path.exists(data_dir):
+        raise FileNotFoundError(
+            f"数据目录不存在: {data_dir}\n"
+            f"请将 NASA IMS Bearing Dataset 的 {dataset}st_test 文件夹放到 dataset/ 下。"
+        )
+
+    num_sensors = config['num_sensors']
+    rows = []
+    for filename in sorted(os.listdir(data_dir)):
+        filepath = os.path.join(data_dir, filename)
+        if not os.path.isfile(filepath):
+            continue
         try:
-            response = requests.get(url, stream=True, timeout=30)
-            response.raise_for_status()
-            temp_path = filepath + ".tmp"
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(temp_path, filepath)
-            print(f"  Downloaded {filename}")
-            return True
-        except (requests.RequestException, IOError) as e:
-            print(f"  Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            for path in [filepath + ".tmp", filepath]:
-                if os.path.exists(path):
-                    try:
-                        os.remove(path)
-                    except OSError:
-                        pass
-            if attempt < max_attempts:
-                time.sleep(2 ** attempt)
-    return False
+            df = pd.read_csv(filepath, sep='\t', header=None)
+            if df.shape[1] < num_sensors:
+                print(f"  跳过 {filename}：列数不足 ({df.shape[1]})")
+                continue
+            # 取前 num_sensors 列
+            mean_abs = df.iloc[:, :num_sensors].abs().mean().values
+            rows.append((filename, mean_abs))
+        except Exception as e:
+            print(f"  警告：无法读取 {filename}: {e}")
 
+    if not rows:
+        raise RuntimeError(f"未能加载任何数据文件，请检查 {data_dir} 目录。")
 
-def download_data(num_shards, download_workers=8):
-    """Download training shards + pinned validation shard."""
-    os.makedirs(DATA_DIR, exist_ok=True)
-    num_train = min(num_shards, MAX_SHARD)
-    ids = list(range(num_train))
-    if VAL_SHARD not in ids:
-        ids.append(VAL_SHARD)
-
-    # Count what's already downloaded
-    existing = sum(1 for i in ids if os.path.exists(os.path.join(DATA_DIR, f"shard_{i:05d}.parquet")))
-    if existing == len(ids):
-        print(f"Data: all {len(ids)} shards already downloaded at {DATA_DIR}")
-        return
-
-    needed = len(ids) - existing
-    print(f"Data: downloading {needed} shards ({existing} already exist)...")
-
-    workers = max(1, min(download_workers, needed))
-    with Pool(processes=workers) as pool:
-        results = pool.map(download_single_shard, ids)
-
-    ok = sum(1 for r in results if r)
-    print(f"Data: {ok}/{len(ids)} shards ready at {DATA_DIR}")
-
-# ---------------------------------------------------------------------------
-# Tokenizer training
-# ---------------------------------------------------------------------------
-
-def list_parquet_files():
-    """Return sorted list of parquet file paths in the data directory."""
-    files = sorted(f for f in os.listdir(DATA_DIR) if f.endswith(".parquet") and not f.endswith(".tmp"))
-    return [os.path.join(DATA_DIR, f) for f in files]
-
-
-def text_iterator(max_chars=1_000_000_000, doc_cap=10_000):
-    """Yield documents from training split (all shards except pinned val shard)."""
-    parquet_paths = [p for p in list_parquet_files() if not p.endswith(VAL_FILENAME)]
-    nchars = 0
-    for filepath in parquet_paths:
-        pf = pq.ParquetFile(filepath)
-        for rg_idx in range(pf.num_row_groups):
-            rg = pf.read_row_group(rg_idx)
-            for text in rg.column("text").to_pylist():
-                doc = text[:doc_cap] if len(text) > doc_cap else text
-                nchars += len(doc)
-                yield doc
-                if nchars >= max_chars:
-                    return
-
-
-def train_tokenizer():
-    """Train BPE tokenizer using rustbpe, save as tiktoken pickle."""
-    tokenizer_pkl = os.path.join(TOKENIZER_DIR, "tokenizer.pkl")
-    token_bytes_path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-
-    if os.path.exists(tokenizer_pkl) and os.path.exists(token_bytes_path):
-        print(f"Tokenizer: already trained at {TOKENIZER_DIR}")
-        return
-
-    os.makedirs(TOKENIZER_DIR, exist_ok=True)
-
-    parquet_files = list_parquet_files()
-    if len(parquet_files) < 2:
-        print("Tokenizer: need at least 2 data shards (1 train + 1 val). Download more data first.")
-        sys.exit(1)
-
-    # --- Train with rustbpe ---
-    print("Tokenizer: training BPE tokenizer...")
-    t0 = time.time()
-
-    tokenizer = rustbpe.Tokenizer()
-    vocab_size_no_special = VOCAB_SIZE - len(SPECIAL_TOKENS)
-    tokenizer.train_from_iterator(text_iterator(), vocab_size_no_special, pattern=SPLIT_PATTERN)
-
-    # Build tiktoken encoding from trained merges
-    pattern = tokenizer.get_pattern()
-    mergeable_ranks = {bytes(k): v for k, v in tokenizer.get_mergeable_ranks()}
-    tokens_offset = len(mergeable_ranks)
-    special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
-    enc = tiktoken.Encoding(
-        name="rustbpe",
-        pat_str=pattern,
-        mergeable_ranks=mergeable_ranks,
-        special_tokens=special_tokens,
+    filenames   = [r[0] for r in rows]
+    values      = np.stack([r[1] for r in rows])   # (N, num_sensors)
+    merged_data = pd.DataFrame(
+        values, index=filenames,
+        columns=[f'Bearing {i+1}' for i in range(num_sensors)]
     )
 
-    # Save tokenizer
-    with open(tokenizer_pkl, "wb") as f:
-        pickle.dump(enc, f)
+    # 将文件名解析为时间戳（格式：2004.02.12.10.32.39）
+    merged_data.index = pd.to_datetime(merged_data.index, format='%Y.%m.%d.%H.%M.%S')
+    merged_data.sort_index(inplace=True)
 
-    t1 = time.time()
-    print(f"Tokenizer: trained in {t1 - t0:.1f}s, saved to {tokenizer_pkl}")
+    return merged_data
 
-    # --- Build token_bytes lookup for BPB evaluation ---
-    print("Tokenizer: building token_bytes lookup...")
-    special_set = set(SPECIAL_TOKENS)
-    token_bytes_list = []
-    for token_id in range(enc.n_vocab):
-        token_str = enc.decode([token_id])
-        if token_str in special_set:
-            token_bytes_list.append(0)
-        else:
-            token_bytes_list.append(len(token_str.encode("utf-8")))
-    token_bytes_tensor = torch.tensor(token_bytes_list, dtype=torch.int32)
-    torch.save(token_bytes_tensor, token_bytes_path)
-    print(f"Tokenizer: saved token_bytes to {token_bytes_path}")
-
-    # Sanity check
-    test = "Hello world! Numbers: 123. Unicode: 你好"
-    encoded = enc.encode_ordinary(test)
-    decoded = enc.decode(encoded)
-    assert decoded == test, f"Tokenizer roundtrip failed: {test!r} -> {decoded!r}"
-    print(f"Tokenizer: sanity check passed (vocab_size={enc.n_vocab})")
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train.py)
+# 特征工程（可选，需同步修改 train.py 中的 INPUT_DIM）
 # ---------------------------------------------------------------------------
 
-class Tokenizer:
-    """Minimal tokenizer wrapper. Training is handled above."""
-
-    def __init__(self, enc):
-        self.enc = enc
-        self.bos_token_id = enc.encode_single_token(BOS_TOKEN)
-
-    @classmethod
-    def from_directory(cls, tokenizer_dir=TOKENIZER_DIR):
-        with open(os.path.join(tokenizer_dir, "tokenizer.pkl"), "rb") as f:
-            enc = pickle.load(f)
-        return cls(enc)
-
-    def get_vocab_size(self):
-        return self.enc.n_vocab
-
-    def get_bos_token_id(self):
-        return self.bos_token_id
-
-    def encode(self, text, prepend=None, num_threads=8):
-        if prepend is not None:
-            prepend_id = prepend if isinstance(prepend, int) else self.enc.encode_single_token(prepend)
-        if isinstance(text, str):
-            ids = self.enc.encode_ordinary(text)
-            if prepend is not None:
-                ids.insert(0, prepend_id)
-        elif isinstance(text, list):
-            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
-            if prepend is not None:
-                for row in ids:
-                    row.insert(0, prepend_id)
-        else:
-            raise ValueError(f"Invalid input type: {type(text)}")
-        return ids
-
-    def decode(self, ids):
-        return self.enc.decode(ids)
-
-
-def get_token_bytes(device="cpu"):
-    path = os.path.join(TOKENIZER_DIR, "token_bytes.pt")
-    with open(path, "rb") as f:
-        return torch.load(f, map_location=device)
-
-
-def _document_batches(split, tokenizer_batch_size=128):
-    """Infinite iterator over document batches from parquet files."""
-    parquet_paths = list_parquet_files()
-    assert len(parquet_paths) > 0, "No parquet files found. Run prepare.py first."
-    val_path = os.path.join(DATA_DIR, VAL_FILENAME)
-    if split == "train":
-        parquet_paths = [p for p in parquet_paths if p != val_path]
-        assert len(parquet_paths) > 0, "No training shards found."
-    else:
-        parquet_paths = [val_path]
-    epoch = 1
-    while True:
-        for filepath in parquet_paths:
-            pf = pq.ParquetFile(filepath)
-            for rg_idx in range(pf.num_row_groups):
-                rg = pf.read_row_group(rg_idx)
-                batch = rg.column('text').to_pylist()
-                for i in range(0, len(batch), tokenizer_batch_size):
-                    yield batch[i:i+tokenizer_batch_size], epoch
-        epoch += 1
-
-
-def make_dataloader(tokenizer, B, T, split, buffer_size=1000):
+def engineer_features(merged_data: pd.DataFrame) -> pd.DataFrame:
     """
-    BOS-aligned dataloader with best-fit packing.
-    Every row starts with BOS. Documents packed using best-fit to minimize cropping.
-    When no document fits remaining space, crops shortest doc to fill exactly.
-    100% utilization (no padding).
+    在原始均值特征基础上添加衍生特征，帮助模型捕捉趋势变化。
+
+    新增特征：
+    - 滚动标准差（窗口=5）：捕捉局部波动幅度
+    - 一阶差分：捕捉相邻时间点的变化速率
+
+    所有新特征与原始特征拼接，NaN 用前向填充 + 0 补齐。
+    启用后 INPUT_DIM = 4 * 3 = 12，请同步修改 train.py。
     """
-    assert split in ["train", "val"]
-    row_capacity = T + 1
-    batches = _document_batches(split)
-    bos_token = tokenizer.get_bos_token_id()
-    doc_buffer = []
-    epoch = 1
+    original    = merged_data.copy()
+    rolling_std = merged_data.rolling(window=5, min_periods=1).std()
+    rolling_std.columns = [f'{c}_std5' for c in rolling_std.columns]
+    diff1 = merged_data.diff().fillna(0)
+    diff1.columns = [f'{c}_diff1' for c in diff1.columns]
 
-    def refill_buffer():
-        nonlocal epoch
-        doc_batch, epoch = next(batches)
-        token_lists = tokenizer.encode(doc_batch, prepend=bos_token)
-        doc_buffer.extend(token_lists)
+    enriched = pd.concat([original, rolling_std, diff1], axis=1)
+    enriched.ffill(inplace=True)
+    enriched.fillna(0, inplace=True)
+    return enriched
 
-    # Pre-allocate buffers: [inputs (B*T) | targets (B*T)]
-    row_buffer = torch.empty((B, row_capacity), dtype=torch.long)
-    cpu_buffer = torch.empty(2 * B * T, dtype=torch.long, pin_memory=True)
-    gpu_buffer = torch.empty(2 * B * T, dtype=torch.long, device="cuda")
-    cpu_inputs = cpu_buffer[:B * T].view(B, T)
-    cpu_targets = cpu_buffer[B * T:].view(B, T)
-    inputs = gpu_buffer[:B * T].view(B, T)
-    targets = gpu_buffer[B * T:].view(B, T)
-
-    while True:
-        for row_idx in range(B):
-            pos = 0
-            while pos < row_capacity:
-                while len(doc_buffer) < buffer_size:
-                    refill_buffer()
-
-                remaining = row_capacity - pos
-
-                # Find largest doc that fits entirely
-                best_idx = -1
-                best_len = 0
-                for i, doc in enumerate(doc_buffer):
-                    doc_len = len(doc)
-                    if doc_len <= remaining and doc_len > best_len:
-                        best_idx = i
-                        best_len = doc_len
-
-                if best_idx >= 0:
-                    doc = doc_buffer.pop(best_idx)
-                    row_buffer[row_idx, pos:pos + len(doc)] = torch.tensor(doc, dtype=torch.long)
-                    pos += len(doc)
-                else:
-                    # No doc fits — crop shortest to fill remaining
-                    shortest_idx = min(range(len(doc_buffer)), key=lambda i: len(doc_buffer[i]))
-                    doc = doc_buffer.pop(shortest_idx)
-                    row_buffer[row_idx, pos:pos + remaining] = torch.tensor(doc[:remaining], dtype=torch.long)
-                    pos += remaining
-
-        cpu_inputs.copy_(row_buffer[:, :-1])
-        cpu_targets.copy_(row_buffer[:, 1:])
-        gpu_buffer.copy_(cpu_buffer, non_blocking=True)
-        yield inputs, targets, epoch
 
 # ---------------------------------------------------------------------------
-# Evaluation (DO NOT CHANGE — this is the fixed metric)
+# 数据准备主函数
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def evaluate_bpb(model, tokenizer, batch_size):
+def prepare_data(use_feature_engineering: bool = False, dataset: str = None):
     """
-    Bits per byte (BPB): vocab size-independent evaluation metric.
-    Sums per-token cross-entropy (in nats), sums target byte lengths,
-    then converts nats/byte to bits/byte. Special tokens (byte length 0)
-    are excluded from both sums.
-    Uses fixed MAX_SEQ_LEN so results are comparable across configs.
+    完整数据准备流程：加载 → （可选特征工程）→ 时间切分 → 归一化。
+
+    Args:
+        use_feature_engineering: 是否启用滚动统计等衍生特征（默认关闭）。
+            若开启，INPUT_DIM 从 4 变为 12，请同步修改 train.py。
+        dataset: 数据集名称 ('1st', '2nd', '3rd')
+
+    Returns:
+        X_train (np.ndarray): 训练特征，shape=(N_train, D)，归一化至 [0,1]
+        X_test  (np.ndarray): 测试特征，shape=(N_test, D)，归一化至 [0,1]
+        y_test  (np.ndarray): 测试集异常标签，0=正常 1=异常
+        scaler  (MinMaxScaler): 仅在训练集上拟合的归一化器
+
+    数据无泄露说明：
+        scaler 仅在 X_train 上 fit，X_test 用 transform。
+        阈值选择应使用训练集重建误差，不应直接用测试集标签搜索（详见 train.py）。
     """
-    token_bytes = get_token_bytes(device="cuda")
-    val_loader = make_dataloader(tokenizer, batch_size, MAX_SEQ_LEN, "val")
-    steps = EVAL_TOKENS // (batch_size * MAX_SEQ_LEN)
-    total_nats = 0.0
-    total_bytes = 0
-    for _ in range(steps):
-        x, y, _ = next(val_loader)
-        loss_flat = model(x, y, reduction='none').view(-1)
-        y_flat = y.view(-1)
-        nbytes = token_bytes[y_flat]
-        mask = nbytes > 0
-        total_nats += (loss_flat * mask).sum().item()
-        total_bytes += nbytes.sum().item()
-    return total_nats / (math.log(2) * total_bytes)
+    if dataset is not None:
+        _current_dataset = dataset
+
+    if dataset is None:
+        dataset = _current_dataset
+
+    suffix = {'1st': '1st_test', '2nd': '2nd_test', '3rd': '3rd_test'}[dataset]
+    print(f"加载轴承数据 ({suffix})...")
+    merged_data = load_bearing_data(dataset)
+    print(f"  共加载 {len(merged_data)} 个时间点")
+
+    if use_feature_engineering:
+        print("  应用特征工程（滚动std + 差分）...")
+        merged_data = engineer_features(merged_data)
+        print(f"  特征维度扩展为 {merged_data.shape[1]}")
+
+    all_labels = get_anomaly_labels(merged_data, dataset)
+
+    config = DATASET_CONFIGS[dataset]
+    train_end     = pd.Timestamp(config['train_end_time'])
+    dataset_train = merged_data[:train_end]
+    dataset_test  = merged_data[train_end:]
+    y_test        = all_labels[len(dataset_train):]
+
+    print(f"  训练样本：{len(dataset_train)}（均为正常）")
+    print(f"  测试样本：{len(dataset_test)}")
+    print(f"  测试集异常：{y_test.sum()} 个（{100 * y_test.sum() / len(y_test):.1f}%）")
+
+    # 归一化：仅在训练集上 fit，防止测试集信息泄露
+    scaler  = preprocessing.MinMaxScaler()
+    X_train = scaler.fit_transform(dataset_train).astype(np.float32)
+    X_test  = scaler.transform(dataset_test).astype(np.float32)
+
+    return X_train, X_test, y_test, scaler
+
 
 # ---------------------------------------------------------------------------
-# Main
+# 缓存读写
+# ---------------------------------------------------------------------------
+
+def save_preprocessed_data(X_train, X_test, y_test, scaler, dataset: str = None):
+    """将预处理结果缓存到磁盘。"""
+    if dataset is None:
+        dataset = _current_dataset
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_file = os.path.join(CACHE_DIR, f"data_{dataset}.pkl")
+    with open(cache_file, 'wb') as f:
+        pickle.dump({
+            'X_train': X_train,
+            'X_test':  X_test,
+            'y_test':  y_test,
+            'scaler':  scaler,
+            'version': CACHE_VERSION,
+            'dataset': dataset,
+        }, f)
+    print(f"数据已缓存至 {cache_file}（版本 {CACHE_VERSION}）")
+
+
+def load_preprocessed_data(dataset: str = None):
+    """
+    从磁盘加载缓存数据。
+    若缓存不存在或版本不匹配，返回 None（调用方需重新调用 prepare_data）。
+    """
+    if dataset is None:
+        dataset = _current_dataset
+    cache_file = os.path.join(CACHE_DIR, f"data_{dataset}.pkl")
+    if not os.path.exists(cache_file):
+        return None
+    with open(cache_file, 'rb') as f:
+        cached = pickle.load(f)
+    if cached.get('version', 0) != CACHE_VERSION:
+        print(f"缓存版本不匹配（当前={cached.get('version',0)}，期望={CACHE_VERSION}），将重新处理。")
+        return None
+    return cached
+
+
+# ---------------------------------------------------------------------------
+# Dataset / DataLoader 工具
+# ---------------------------------------------------------------------------
+
+class BearingDataset(torch.utils.data.Dataset):
+    """轴承数据的简单 Dataset 包装。"""
+
+    def __init__(self, X: np.ndarray):
+        self.X = torch.from_numpy(X).float()
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx]
+
+
+def make_dataloader(X: np.ndarray, batch_size: int,
+                    shuffle: bool = True, drop_last: bool = False):
+    """从 numpy 数组创建 DataLoader。"""
+    return torch.utils.data.DataLoader(
+        BearingDataset(X),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        num_workers=0,
+        pin_memory=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 评估工具（供 train.py import）
+# ---------------------------------------------------------------------------
+
+def calculate_metrics(y_true, y_pred) -> dict:
+    """
+    计算二分类指标：precision / recall / f1 / accuracy。
+
+    Args:
+        y_true: numpy array 或 torch.Tensor，shape=(N,)
+        y_pred: numpy array 或 torch.Tensor，shape=(N,)，二值 0/1
+    """
+    if not torch.is_tensor(y_true):
+        y_true = torch.from_numpy(np.array(y_true)).float()
+    if not torch.is_tensor(y_pred):
+        y_pred = torch.from_numpy(np.array(y_pred)).float()
+
+    tp = ((y_true == 1) & (y_pred == 1)).sum().float()
+    tn = ((y_true == 0) & (y_pred == 0)).sum().float()
+    fp = ((y_true == 0) & (y_pred == 1)).sum().float()
+    fn = ((y_true == 1) & (y_pred == 0)).sum().float()
+
+    precision = tp / (tp + fp + 1e-8)
+    recall    = tp / (tp + fn + 1e-8)
+    f1        = 2 * precision * recall / (precision + recall + 1e-8)
+    accuracy  = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+
+    return {
+        'precision': precision.item(),
+        'recall':    recall.item(),
+        'f1':        f1.item(),
+        'accuracy':  accuracy.item(),
+    }
+
+
+def find_best_threshold(errors: torch.Tensor, labels: torch.Tensor,
+                        n_thresholds: int = 4000) -> tuple:
+    """
+    网格搜索使 F1 最大的阈值。
+
+    ⚠️  应传入验证集误差与标签，避免用测试集搜索阈值（数据泄露）。
+
+    Args:
+        errors       : 1-D tensor，重建误差
+        labels       : 1-D tensor，真实标签（0/1）
+        n_thresholds : 候选阈值数量
+
+    Returns:
+        (best_threshold: float, best_f1: float)
+    """
+    thresholds = torch.linspace(errors.min(), errors.max(), n_thresholds)
+    best_f1, best_t = 0.0, thresholds[0].item()
+
+    for t in thresholds:
+        pred = (errors > t).float()
+        tp = ((labels == 1) & (pred == 1)).sum()
+        fp = ((labels == 0) & (pred == 1)).sum()
+        fn = ((labels == 1) & (pred == 0)).sum()
+        precision = tp / (tp + fp + 1e-8)
+        recall    = tp / (tp + fn + 1e-8)
+        f1        = (2 * precision * recall / (precision + recall + 1e-8)).item()
+        if f1 > best_f1:
+            best_f1, best_t = f1, t.item()
+
+    return best_t, best_f1
+
+
+# ---------------------------------------------------------------------------
+# 主程序
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare data and tokenizer for autoresearch")
-    parser.add_argument("--num-shards", type=int, default=10, help="Number of training shards to download (-1 = all). Val shard is always pinned.")
-    parser.add_argument("--download-workers", type=int, default=8, help="Number of parallel download workers")
+    parser = argparse.ArgumentParser(description="准备 NASA Bearing 数据")
+    parser.add_argument("--dataset", type=str, default=DEFAULT_DATASET,
+                        choices=['1st', '2nd', '3rd'],
+                        help="选择数据集 (1st, 2nd, 3rd)")
+    parser.add_argument("--force",    action="store_true", help="忽略缓存，强制重新处理")
+    parser.add_argument("--features", action="store_true", help="启用特征工程（INPUT_DIM=12）")
     args = parser.parse_args()
 
-    num_shards = MAX_SHARD if args.num_shards == -1 else args.num_shards
+    _current_dataset = args.dataset
 
-    print(f"Cache directory: {CACHE_DIR}")
-    print()
+    cached = None if args.force else load_preprocessed_data(args.dataset)
 
-    # Step 1: Download data
-    download_data(num_shards, download_workers=args.download_workers)
-    print()
+    if cached is not None:
+        suffix = {'1st': '1st_test', '2nd': '2nd_test', '3rd': '3rd_test'}[args.dataset]
+        print(f"使用缓存数据 ({suffix})")
+        X_train = cached['X_train']
+        X_test  = cached['X_test']
+        y_test  = cached['y_test']
+    else:
+        X_train, X_test, y_test, scaler = prepare_data(use_feature_engineering=args.features, dataset=args.dataset)
+        save_preprocessed_data(X_train, X_test, y_test, scaler, args.dataset)
 
-    # Step 2: Train tokenizer
-    train_tokenizer()
-    print()
-    print("Done! Ready to train.")
+    print(f"\n数据维度：")
+    print(f"  X_train : {X_train.shape}")
+    print(f"  X_test  : {X_test.shape}")
+    print(f"  特征数  : {X_train.shape[1]}  ← 请确认 train.py 中 INPUT_DIM 与此一致")
+    print(f"  测试异常: {y_test.sum()} / {len(y_test)}")
+    print("\n数据准备完成，可以开始训练。")
