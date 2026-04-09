@@ -1,19 +1,15 @@
 [project]
-name = "autoresearch"
+name = "auto-anomaly"
 version = "0.1.0"
-description = "Autonomous pretraining research swarm"
+description = "NASA Bearing Anomaly Detection with Autoencoder"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "kernels>=0.11.7",
     "matplotlib>=3.10.8",
     "numpy>=2.2.6",
     "pandas>=2.3.3",
-    "pyarrow>=21.0.0",
-    "requests>=2.32.0",
-    "rustbpe>=0.1.0",
-    "tiktoken>=0.11.0",
-    "torch==2.9.1",
+    "scikit-learn>=1.6.0",
+    "torch>=2.5.0",
 ]
 
 [tool.uv.sources]
@@ -25,3 +21,8 @@ torch = [
 name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
+
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+explicit = false
