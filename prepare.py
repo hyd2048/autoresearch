@@ -59,8 +59,8 @@ TIME_BUDGET  = 300   # 训练时间预算，秒（5分钟）
 # ---------------------------------------------------------------------------
 
 DATA_DIR      = os.path.join(os.path.dirname(__file__), "dataset")
-CACHE_DIR     = os.path.join(os.path.expanduser("~"), ".cache", "auto-anomaly")
-CACHE_VERSION = 4   # 修改数据处理逻辑时请递增此值，旧缓存会自动失效
+CACHE_DIR     = os.path.join(os.path.expanduser("~"), ".cache", "autoanomaly")
+CACHE_VERSION = 1   # 修改数据处理逻辑时请递增此值，旧缓存会自动失效
 
 # 全局变量：当前使用的数据集
 _current_dataset = DEFAULT_DATASET
