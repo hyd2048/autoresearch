@@ -7,7 +7,7 @@
 要设置一个新的实验，请与用户一起完成以下步骤：
 
 1. **确定运行标签（run tag）**：根据今天的日期和使用的数据集提出一个标签（例如 `mar5-1st`）。分支 `exp/<tag>` 必须不存在——这是一个全新的实验。
-2. **创建分支**：从当前 autoanomaly 分支执行 `git checkout -b exp/<tag>`。
+2. **创建分支**：先 `git checkout autoanomaly`  到 autoanomaly 分支，再执行 `git checkout -b exp/<tag>`。
 3. **阅读范围内的文件**：该仓库较小，请阅读以下文件以获取完整上下文：
 
    * `README.md` —— 仓库背景信息。
