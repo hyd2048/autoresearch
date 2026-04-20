@@ -154,7 +154,7 @@ grep "^val_f1:\|^peak_vram_mb:" run.log
    * 尝试修复
    * 若多次失败，放弃该思路
 
-7. 记录结果到 tsv（注意：**不要提交 results.tsv 到 git**）
+7. 追加写入结果到 tsv（注意：**不要提交 results.tsv 到 git**）
 
 8. 如果 **val_f1 提升（更高）** → 保留
 
