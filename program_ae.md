@@ -6,13 +6,13 @@
 
 要设置一个新的实验，请与用户一起完成以下步骤：
 
-1. **确定运行标签（run tag）**：根据今天的日期和使用的数据集提出一个标签（例如 `mar5-1st`）。分支 `exp/<tag>` 必须不存在——这是一个全新的实验。
-2. **创建分支**：先 `git checkout autoanomaly`  到 autoanomaly 分支，再执行 `git checkout -b exp/<tag>`。
+1. **确定运行标签（run tag）**：根据今天的日期和使用的数据集提出一个标签（例如 `mar5-1st`）。分支 `ae/<tag>` 必须不存在——这是一个全新的实验。
+2. **创建分支**：先 `git checkout autoanomaly`  到 autoanomaly 分支，再执行 `git checkout -b ae/<tag>`。
 3. **阅读范围内的文件**：该仓库较小，请阅读以下文件以获取完整上下文：
 
    * `README.md` —— 仓库背景信息。
    * `prepare.py` —— 数据准备、特征处理、评估函数（**不要修改**）。
-   * `train.py` —— 需要修改的文件（模型结构、训练逻辑等）。
+   * `train_ae.py` —— 需要修改的文件（模型结构、训练逻辑等）。
 4. **验证数据存在**：确保数据目录 `dataset/` 存在且可读取（或已有缓存 `~/.cache/autoanomaly/`）。
 5. **初始化 results.tsv**：对每个数据集创建仅包含表头的 `results.tsv` 文件（例如`results-1st.tsv`）。基线结果将在第一次运行后记录。
 6. **确认并开始**：确认设置无误。
@@ -28,12 +28,12 @@
 运行方式：
 
 ```
-uv run train.py --dataset 数据集编号
+uv run train_ae.py --dataset 数据集编号
 ```
 
 **你可以做的：**
 
-* 修改 `train.py` —— 唯一允许编辑的文件（模型结构、损失函数、训练策略、超参数等）
+* 修改 `train_ae.py` —— 唯一允许编辑的文件（模型结构、损失函数、训练策略、超参数等）
 
 **你不能做的：**
 
@@ -52,7 +52,7 @@ uv run train.py --dataset 数据集编号
 
 ### 约束补充
 
-* 这是**无监督异常检测（Autoencoder）任务**
+* 这是**无监督异常检测任务**
 * 训练集**全部为正常样本**
 * 测试集包含异常标签（仅用于最终评估）
 * 阈值选择必须避免数据泄露（优先使用 `train_percentile`）
@@ -127,17 +127,17 @@ d4e5f6g	0.000000	0.0	crash	OOM
 
 ## The experiment loop
 
-实验在专用分支上进行（例如 `exp/mar5-1st`）。
+实验在专用分支上进行（例如 `ae/mar5-1st`）。
 
 **无限循环执行：**
 
 1. 查看当前 git 状态（分支/提交）
-2. 修改 `train.py`，实现新的实验想法
+2. 修改 `train_ae.py`，实现新的实验想法
 3. 提交 git
 4. 运行实验：
 
 ```
-uv run train.py --dataset 数据集编号 > run.log 2>&1
+uv run train_ae.py --dataset 数据集编号 > run.log 2>&1
 ```
 
 （重定向所有输出，不要使用 tee）
