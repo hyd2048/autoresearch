@@ -1,13 +1,13 @@
 """
-Autoencoder for NASA Bearing Anomaly Detection — train.py
+Autoencoder for NASA Bearing Anomaly Detection — train_ae.py
 这是 Agent 唯一可以修改的文件。模型结构、优化器、超参数、训练循环均可改动。
 
 目标指标：val_f1（越高越好）。时间预算：5 分钟墙钟时间。
 
 Usage:
-    python train.py                    # Run on default 2nd_test
-    python train.py --dataset 1st      # Run on 1st_test
-    python train.py --dataset 3rd      # Run on 3rd_test
+    python train_ae.py                    # Run on default 2nd_test
+    python train_ae.py --dataset 1st      # Run on 1st_test
+    python train_ae.py --dataset 3rd      # Run on 3rd_test
 """
 
 import os
